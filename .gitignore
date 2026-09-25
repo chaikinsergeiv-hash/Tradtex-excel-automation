@@ -1,0 +1,22 @@
+# Secrets
+**/wb_token.txt
+**/wb_adv_token.txt
+*.token
+.env
+.env.*
+
+# Generated data
+*.csv
+*.log
+WB_Реклама_API_Диагностика.txt
+*_NEW_*.csv
+
+# Temporary files
+*.tmp
+*.tmp.csv
+~$*
+Thumbs.db
+.DS_Store
+
+# Power BI / Excel outputs should normally stay outside this repo
+*.pbix
