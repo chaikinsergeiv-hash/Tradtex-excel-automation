@@ -778,12 +778,15 @@ $csvLines = $Rows |
 # Строка sep=; — стандартная подсказка Excel о разделителе.
 $excelCsvLines = @("sep=;") + $csvLines
 
-$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+# Для прямого открытия двойным кликом в русской версии Excel
+# надёжнее использовать системную Windows-1251. UTF-8 даже с BOM Excel 2016
+# иногда открывает как ANSI и превращает кириллицу в "РџС...".
+$excelEncoding = [System.Text.Encoding]::GetEncoding(1251)
 
 [System.IO.File]::WriteAllLines(
     $TempPath,
     $excelCsvLines,
-    $utf8Bom
+    $excelEncoding
 )
 
 # ================================================================
