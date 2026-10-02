@@ -129,7 +129,7 @@ function Convert-ToDoubleOrZero {
     }
 
     # Убираем обычные и неразрывные пробелы-разделители.
-    $text = $text.Replace([char]0x00A0, "").Replace(" ", "")
+    $text = $text.Replace(([string][char]0x00A0), "").Replace(" ", "")
 
     $number = [double]0
     $styles = [System.Globalization.NumberStyles]::Any
