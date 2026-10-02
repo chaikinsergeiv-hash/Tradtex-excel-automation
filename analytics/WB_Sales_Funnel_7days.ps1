@@ -1,5 +1,5 @@
 ﻿# ================================================================
-# WB ANALYTICS — ВОРОНКА ПРОДАЖ ЗА 7 ДНЕЙ — TEST
+# WB ANALYTICS — ВОРОНКА ПРОДАЖ ЗА 7 ДНЕЙ
 #
 # Итог:
 #   1 строка = 1 артикул WB
@@ -43,13 +43,13 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $TokenPath = Join-Path $ScriptDir "wb_analytics_token.txt"
 
-$OutputPath = Join-Path $ScriptDir "WB_Воронка_7дней_TEST.csv"
-$TempPath = Join-Path $ScriptDir "WB_Воронка_7дней_TEST.tmp.csv"
-$LogPath = Join-Path $ScriptDir "WB_Воронка_7дней_TEST.log"
+$OutputPath = Join-Path $ScriptDir "WB_Воронка_7дней.csv"
+$TempPath = Join-Path $ScriptDir "WB_Воронка_7дней.tmp.csv"
+$LogPath = Join-Path $ScriptDir "WB_Воронка_7дней.log"
 
-$StockZipPath = Join-Path $ScriptDir "WB_Остатки_14д_TEST.zip"
-$StockExtractDir = Join-Path $ScriptDir "WB_Остатки_14д_TEST_EXTRACTED"
-$StockCsvCopyPath = Join-Path $ScriptDir "WB_Остатки_14д_TEST.csv"
+$StockZipPath = Join-Path $ScriptDir "WB_Остатки_14д.zip"
+$StockExtractDir = Join-Path $ScriptDir "WB_Остатки_14д_EXTRACTED"
+$StockCsvCopyPath = Join-Path $ScriptDir "WB_Остатки_14д.csv"
 
 # ================================================================
 # 3. ПЕРИОДЫ
@@ -817,13 +817,13 @@ for ($attempt = 1; $attempt -le $replaceAttempts; $attempt++) {
 }
 
 if (-not $replaceSucceeded) {
-    $fallback = Join-Path $ScriptDir ("WB_Воронка_7дней_TEST_NEW_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $fallback = Join-Path $ScriptDir ("WB_Воронка_7дней_NEW_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
     if (Test-Path -LiteralPath $TempPath) {
         Move-Item -LiteralPath $TempPath -Destination $fallback -Force
     }
 
-    throw "WB_Воронка_7дней_TEST.csv заблокирован. Новые данные сохранены: $fallback"
+    throw "WB_Воронка_7дней.csv заблокирован. Новые данные сохранены: $fallback"
 }
 
 Write-Log "ГОТОВО."
