@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 # 1. НАСТРОЙКИ
 # ================================================================
 
-# В тестовой версии берём ВСЕ кампании, у которых за период есть фактический расход > 0.
+# В рабочей версии берём ВСЕ кампании, у которых за период есть фактический расход > 0.
 # Это нужно, чтобы не терять малые кампании и ассоциативные конверсии.
 # Защита от неожиданного роста количества запросов fullstats.
 # При текущих ~280 кампаниях требуется 6 пакетов по 50 ID.
@@ -45,11 +45,11 @@ $FullStatsPauseSeconds = 22
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $TokenPath  = Join-Path $ScriptDir "wb_adv_token.txt"
-$OutputPath    = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.csv"
-$TempPath      = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.tmp.csv"
-$MultiPath     = Join-Path $ScriptDir "WB_Реклама_МУЛЬТИАРТИКУЛ_TEST.csv"
-$MultiTempPath = Join-Path $ScriptDir "WB_Реклама_МУЛЬТИАРТИКУЛ_TEST.tmp.csv"
-$LogPath       = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.log"
+$OutputPath    = Join-Path $ScriptDir "WB_Реклама_7дней.csv"
+$TempPath      = Join-Path $ScriptDir "WB_Реклама_7дней.tmp.csv"
+$MultiPath     = Join-Path $ScriptDir "WB_Реклама_МУЛЬТИАРТИКУЛ.csv"
+$MultiTempPath = Join-Path $ScriptDir "WB_Реклама_МУЛЬТИАРТИКУЛ.tmp.csv"
+$LogPath       = Join-Path $ScriptDir "WB_Реклама_7дней.log"
 
 
 # ================================================================
@@ -672,10 +672,10 @@ $FullStatsBatches = Split-IntoBatches -Items $FullStatsIds -Size 50
 Write-Log "Запросов fullstats потребуется: $($FullStatsBatches.Count)."
 
 if ($FullStatsBatches.Count -gt $MaxFullStatsBatches) {
-    throw "ЗАЩИТА ТЕСТА: требуется $($FullStatsBatches.Count) запросов fullstats, разрешено максимум $MaxFullStatsBatches. Fullstats НЕ запускался."
+    throw "ЗАЩИТА API: требуется $($FullStatsBatches.Count) запросов fullstats, разрешено максимум $MaxFullStatsBatches. Fullstats НЕ запускался."
 }
 
-Write-Log "Защита лимита: максимум fullstats-пакетов в тесте = $MaxFullStatsBatches."
+Write-Log "Защита лимита: максимум fullstats-пакетов в рабочем запуске = $MaxFullStatsBatches."
 
 if ($FullStatsBatches.Count -gt 1) {
     $estimatedSeconds = ($FullStatsBatches.Count - 1) * $FullStatsPauseSeconds
@@ -989,7 +989,7 @@ foreach ($advertId in ($FullStatsIds | Sort-Object)) {
         "CPM"                        = $cpm
         "CPO"                        = $cpo
 
-        # Контрольные поля тестовой версии.
+        # Контрольные поля рабочей версии.
         # Они показывают, какая часть итогов пришла от ассоциативных nmId.
         "Ассоц. заказы (контроль)"   = $total.AssocOrders
         "Ассоц. отмены (контроль)"   = $total.AssocCanceled
@@ -1147,13 +1147,13 @@ for ($attempt = 1; $attempt -le $replaceAttempts; $attempt++) {
 }
 
 if (-not $replaceSucceeded) {
-    $fallback = Join-Path $ScriptDir ("WB_Реклама_7дней_TEST_NEW_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $fallback = Join-Path $ScriptDir ("WB_Реклама_7дней_NEW_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
     if (Test-Path -LiteralPath $TempPath) {
         Move-Item -LiteralPath $TempPath -Destination $fallback -Force
     }
 
-    throw "WB_Реклама_7дней_TEST.csv заблокирован. Новые данные сохранены: $fallback"
+    throw "WB_Реклама_7дней.csv заблокирован. Новые данные сохранены: $fallback"
 }
 
 
