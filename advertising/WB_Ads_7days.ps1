@@ -4,9 +4,9 @@
 # Архитектура:
 #   1) /adv/v1/upd -> история фактических затрат за 7 полных дней
 #   2) суммируем updSum по campaign ID
-#   3) оставляем только кампании с расходом >= 100 руб.
-#   4) только для них получаем сведения о кампании
-#   5) только для них вызываем /adv/v3/fullstats
+#   3) оставляем все кампании с фактическим расходом > 0 руб.
+#   4) для них получаем сведения о кампании
+#   5) для них вызываем /adv/v3/fullstats
 #   6) формируем CSV по товарам
 #
 # Нужен токен WB API категории "Продвижение".
@@ -21,8 +21,14 @@ $ErrorActionPreference = "Stop"
 # 1. НАСТРОЙКИ
 # ================================================================
 
-# Кампании с расходом меньше этого значения не запрашиваем в fullstats.
-$MinCampaignSpend = 100
+# В тестовой версии берём ВСЕ кампании, у которых за период есть фактический расход > 0.
+# Это нужно, чтобы не терять малые кампании и ассоциативные конверсии.
+$MinCampaignSpend = 0
+
+# Защита от неожиданного роста количества запросов fullstats.
+# При текущих ~280 кампаниях требуется 6 пакетов по 50 ID.
+# Если потребуется больше 6 пакетов, тестовая версия остановится ДО fullstats.
+$MaxFullStatsBatches = 6
 
 # Историю затрат /adv/v1/upd загружаем ПО ДНЯМ.
 # Это уменьшает размер каждого ответа и защищает от зависания длинного 7-дневного запроса.
@@ -41,9 +47,9 @@ $FullStatsPauseSeconds = 22
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $TokenPath  = Join-Path $ScriptDir "wb_adv_token.txt"
-$OutputPath = Join-Path $ScriptDir "WB_Реклама_7дней.csv"
-$TempPath   = Join-Path $ScriptDir "WB_Реклама_7дней.tmp.csv"
-$LogPath    = Join-Path $ScriptDir "WB_Реклама_7дней.log"
+$OutputPath = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.csv"
+$TempPath   = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.tmp.csv"
+$LogPath    = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.log"
 
 
 # ================================================================
@@ -359,7 +365,7 @@ $script:AuthorizationHeader = "Bearer $Token"
 Write-Log "============================================================"
 Write-Log "Старт выгрузки рекламной статистики WB за 7 дней."
 Write-Log "Период: $BeginDate - $EndDate."
-Write-Log "Шаг 1: история затрат -> фильтр расход >= $MinCampaignSpend руб."
+Write-Log "Шаг 1: история затрат -> берём все кампании с фактическим расходом > 0 руб."
 
 
 # ================================================================
@@ -467,7 +473,7 @@ foreach ($item in $updRows) {
 
 $QualifiedBySpend = @(
     $SpendMap.Values |
-        Where-Object { $_.Spend -ge $MinCampaignSpend } |
+        Where-Object { $_.Spend -gt 0 } |
         Sort-Object AdvertId
 )
 
@@ -477,11 +483,11 @@ $QualifiedIds = @(
 )
 
 Write-Log "Кампаний с любыми затратами за период: $($SpendMap.Count)."
-Write-Log "Кампаний с расходом >= $MinCampaignSpend руб.: $($QualifiedIds.Count)."
+Write-Log "Кампаний с фактическим расходом > 0 руб.: $($QualifiedIds.Count)."
 
 
 if ($QualifiedIds.Count -eq 0) {
-    Write-Log "Нет кампаний, прошедших фильтр расхода."
+    Write-Log "Нет кампаний с фактическим расходом > 0 руб."
 }
 
 
@@ -549,7 +555,7 @@ foreach ($campaign in $items) {
     $advertId = [Int64]$idRaw
     $advertKey = [string]$advertId
 
-    # Нас интересуют только кампании, уже прошедшие spend >= 100.
+    # Нас интересуют только кампании, уже прошедшие spend > 0.
     if (-not $QualifiedIdSet.ContainsKey($advertKey)) {
         continue
     }
@@ -605,7 +611,7 @@ Write-Log "Из расход-фильтра найдены в справочни
 # Так как предыдущий запрос уже был ограничен statuses=7,9,11,
 # в fullstats отправляем только пересечение:
 #
-#   расход >= 100
+#   расход > 0
 #   И
 #   кампания найдена среди статусов 7/9/11
 
@@ -631,6 +637,12 @@ if ($MissingInfoCount -gt 0) {
 $FullStatsBatches = Split-IntoBatches -Items $FullStatsIds -Size 50
 
 Write-Log "Запросов fullstats потребуется: $($FullStatsBatches.Count)."
+
+if ($FullStatsBatches.Count -gt $MaxFullStatsBatches) {
+    throw "ЗАЩИТА ТЕСТА: требуется $($FullStatsBatches.Count) запросов fullstats, разрешено максимум $MaxFullStatsBatches. Fullstats НЕ запускался."
+}
+
+Write-Log "Защита лимита: максимум fullstats-пакетов в тесте = $MaxFullStatsBatches."
 
 if ($FullStatsBatches.Count -gt 1) {
     $estimatedSeconds = ($FullStatsBatches.Count - 1) * $FullStatsPauseSeconds
@@ -781,7 +793,7 @@ foreach ($stat in ($StatsMap.Values | Sort-Object AdvertId, NmId)) {
         continue
     }
 
-    if ($SpendMap[$campaignKey].Spend -lt $MinCampaignSpend) {
+    if ($SpendMap[$campaignKey].Spend -le 0) {
         continue
     }
 
@@ -852,6 +864,9 @@ foreach ($stat in ($StatsMap.Values | Sort-Object AdvertId, NmId)) {
         0
     }
 
+    # В кабинете WB "Принятые заказы" = созданные заказы - отмены.
+    $acceptedOrders = [Int64]$stat.Orders - [Int64]$stat.Canceled
+
     $Rows += [pscustomobject][ordered]@{
         "Название кампании"      = $campaignName
         "Раздел (тип РК)"        = $bidTypeName
@@ -870,6 +885,7 @@ foreach ($stat in ($StatsMap.Values | Sort-Object AdvertId, NmId)) {
         "CTR"                    = $ctr
         "Корзины (acc.)"         = $stat.Atbs
         "Заказы (acc.)"          = $stat.Orders
+        "Принятые заказы"        = $acceptedOrders
         "Отмены заказов"         = $stat.Canceled
         "Выручка (acc.)"         = [Math]::Round($stat.Revenue, 2)
         "CR (acc.)"              = $cr
@@ -905,6 +921,7 @@ $Headers = @(
     "CTR",
     "Корзины (acc.)",
     "Заказы (acc.)",
+    "Принятые заказы",
     "Отмены заказов",
     "Выручка (acc.)",
     "CR (acc.)",
@@ -977,13 +994,13 @@ for ($attempt = 1; $attempt -le $replaceAttempts; $attempt++) {
 
 
 if (-not $replaceSucceeded) {
-    $fallback = Join-Path $ScriptDir ("WB_Реклама_7дней_NEW_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $fallback = Join-Path $ScriptDir ("WB_Реклама_7дней_TEST_NEW_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
     if (Test-Path -LiteralPath $TempPath) {
         Move-Item -LiteralPath $TempPath -Destination $fallback -Force
     }
 
-    throw "WB_Реклама_7дней.csv заблокирован. Новые данные сохранены: $fallback"
+    throw "WB_Реклама_7дней_TEST.csv заблокирован. Новые данные сохранены: $fallback"
 }
 
 
@@ -991,14 +1008,14 @@ Write-Log "ГОТОВО."
 Write-Log "CSV: $OutputPath"
 Write-Log "Период: $BeginDate - $EndDate."
 Write-Log "Кампаний с затратами: $($SpendMap.Count)."
-Write-Log "Кампаний с расходом >= $MinCampaignSpend руб.: $($QualifiedIds.Count)."
+Write-Log "Кампаний с фактическим расходом > 0 руб.: $($QualifiedIds.Count)."
 Write-Log "Кампаний отправлено в fullstats: $($FullStatsIds.Count)."
 Write-Log "Строк: $($Rows.Count)."
 
 Write-Host ""
 Write-Host "ОБНОВЛЕНИЕ РЕКЛАМЫ ЗАВЕРШЕНО" -ForegroundColor Green
 Write-Host "Период: $BeginDate - $EndDate"
-Write-Host "Расход-фильтр: >= $MinCampaignSpend руб."
-Write-Host "Кампаний с расходом >= порога: $($QualifiedIds.Count)"
+Write-Host "Расход-фильтр: все кампании с расходом > 0 руб."
+Write-Host "Кампаний с фактическим расходом: $($QualifiedIds.Count)"
 Write-Host "Запросов fullstats: $($FullStatsBatches.Count)"
 Write-Host "Файл: $OutputPath"
