@@ -4,9 +4,9 @@
 # Архитектура:
 #   1) /adv/v1/upd -> история фактических затрат за 7 полных дней
 #   2) суммируем updSum по campaign ID
-#   3) оставляем только кампании с расходом >= 100 руб.
-#   4) только для них получаем сведения о кампании
-#   5) только для них вызываем /adv/v3/fullstats
+#   3) оставляем все кампании с фактическим расходом > 0 руб.
+#   4) для них получаем сведения о кампании
+#   5) для них вызываем /adv/v3/fullstats
 #   6) формируем CSV по товарам
 #
 # Нужен токен WB API категории "Продвижение".
@@ -21,8 +21,12 @@ $ErrorActionPreference = "Stop"
 # 1. НАСТРОЙКИ
 # ================================================================
 
-# Кампании с расходом меньше этого значения не запрашиваем в fullstats.
-$MinCampaignSpend = 100
+# В рабочей версии берём ВСЕ кампании, у которых за период есть фактический расход > 0.
+# Это нужно, чтобы не терять малые кампании и ассоциативные конверсии.
+# Защита от неожиданного роста количества запросов fullstats.
+# При текущих ~280 кампаниях требуется 6 пакетов по 50 ID.
+# Если потребуется больше 6 пакетов, тестовая версия остановится ДО fullstats.
+$MaxFullStatsBatches = 6
 
 # Историю затрат /adv/v1/upd загружаем ПО ДНЯМ.
 # Это уменьшает размер каждого ответа и защищает от зависания длинного 7-дневного запроса.
@@ -41,9 +45,11 @@ $FullStatsPauseSeconds = 22
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $TokenPath  = Join-Path $ScriptDir "wb_adv_token.txt"
-$OutputPath = Join-Path $ScriptDir "WB_Реклама_7дней.csv"
-$TempPath   = Join-Path $ScriptDir "WB_Реклама_7дней.tmp.csv"
-$LogPath    = Join-Path $ScriptDir "WB_Реклама_7дней.log"
+$OutputPath    = Join-Path $ScriptDir "WB_Реклама_7дней.csv"
+$TempPath      = Join-Path $ScriptDir "WB_Реклама_7дней.tmp.csv"
+$MultiPath     = Join-Path $ScriptDir "WB_Реклама_МУЛЬТИАРТИКУЛ.csv"
+$MultiTempPath = Join-Path $ScriptDir "WB_Реклама_МУЛЬТИАРТИКУЛ.tmp.csv"
+$LogPath       = Join-Path $ScriptDir "WB_Реклама_7дней.log"
 
 
 # ================================================================
@@ -359,7 +365,7 @@ $script:AuthorizationHeader = "Bearer $Token"
 Write-Log "============================================================"
 Write-Log "Старт выгрузки рекламной статистики WB за 7 дней."
 Write-Log "Период: $BeginDate - $EndDate."
-Write-Log "Шаг 1: история затрат -> фильтр расход >= $MinCampaignSpend руб."
+Write-Log "Шаг 1: история затрат -> берём все кампании с фактическим расходом > 0 руб."
 
 
 # ================================================================
@@ -467,7 +473,7 @@ foreach ($item in $updRows) {
 
 $QualifiedBySpend = @(
     $SpendMap.Values |
-        Where-Object { $_.Spend -ge $MinCampaignSpend } |
+        Where-Object { $_.Spend -gt 0 } |
         Sort-Object AdvertId
 )
 
@@ -477,11 +483,11 @@ $QualifiedIds = @(
 )
 
 Write-Log "Кампаний с любыми затратами за период: $($SpendMap.Count)."
-Write-Log "Кампаний с расходом >= $MinCampaignSpend руб.: $($QualifiedIds.Count)."
+Write-Log "Кампаний с фактическим расходом > 0 руб.: $($QualifiedIds.Count)."
 
 
 if ($QualifiedIds.Count -eq 0) {
-    Write-Log "Нет кампаний, прошедших фильтр расхода."
+    Write-Log "Нет кампаний с фактическим расходом > 0 руб."
 }
 
 
@@ -499,7 +505,7 @@ if ($QualifiedIds.Count -eq 0) {
 #
 # Он возвращает сведения о кампаниях поддерживаемых fullstats статусов.
 # После этого PowerShell ЛОКАЛЬНО оставляет только те campaign ID,
-# которые уже прошли фильтр расхода >= 100 руб.
+# которые имеют фактический расход > 0 руб.
 #
 # Таким образом этап сведений о кампаниях = 1 API-запрос.
 
@@ -549,7 +555,7 @@ foreach ($campaign in $items) {
     $advertId = [Int64]$idRaw
     $advertKey = [string]$advertId
 
-    # Нас интересуют только кампании, уже прошедшие spend >= 100.
+    # Нас интересуют только кампании, уже прошедшие spend > 0.
     if (-not $QualifiedIdSet.ContainsKey($advertKey)) {
         continue
     }
@@ -598,6 +604,39 @@ foreach ($campaign in $items) {
 
 Write-Log "Из расход-фильтра найдены в справочнике 7/9/11: $($CampaignInfoMap.Count) из $($QualifiedIds.Count)."
 
+# Для каждой кампании отдельно запоминаем товары, которые действительно
+# находятся в её nm_settings. Это важно: fullstats может вернуть nmId товара,
+# который был КУПЛЕН после рекламы другой кампании. Такой nmId является
+# ассоциативной конверсией, а не рекламируемым товаром этой кампании.
+$CampaignNmSetMap = @{}
+$CampaignsWithoutNmSettings = 0
+
+foreach ($campaignKey in $CampaignInfoMap.Keys) {
+    $nmSet = @{}
+
+    foreach ($nmSetting in @($CampaignInfoMap[$campaignKey].NmSettings)) {
+        $nmIdRaw = Get-Field $nmSetting "nm_id" $null
+
+        if ($null -eq $nmIdRaw) {
+            $nmIdRaw = Get-Field $nmSetting "nmId" $null
+        }
+
+        if ($null -eq $nmIdRaw) {
+            continue
+        }
+
+        $nmSet[[string][Int64]$nmIdRaw] = $true
+    }
+
+    if ($nmSet.Count -eq 0) {
+        $CampaignsWithoutNmSettings++
+    }
+
+    $CampaignNmSetMap[$campaignKey] = $nmSet
+}
+
+Write-Log "Кампаний без nm_settings: $CampaignsWithoutNmSettings."
+
 # ================================================================
 # 10. ID ДЛЯ FULLSTATS
 # ================================================================
@@ -605,7 +644,7 @@ Write-Log "Из расход-фильтра найдены в справочни
 # Так как предыдущий запрос уже был ограничен statuses=7,9,11,
 # в fullstats отправляем только пересечение:
 #
-#   расход >= 100
+#   расход > 0
 #   И
 #   кампания найдена среди статусов 7/9/11
 
@@ -631,6 +670,12 @@ if ($MissingInfoCount -gt 0) {
 $FullStatsBatches = Split-IntoBatches -Items $FullStatsIds -Size 50
 
 Write-Log "Запросов fullstats потребуется: $($FullStatsBatches.Count)."
+
+if ($FullStatsBatches.Count -gt $MaxFullStatsBatches) {
+    throw "ЗАЩИТА API: требуется $($FullStatsBatches.Count) запросов fullstats, разрешено максимум $MaxFullStatsBatches. Fullstats НЕ запускался."
+}
+
+Write-Log "Защита лимита: максимум fullstats-пакетов в рабочем запуске = $MaxFullStatsBatches."
 
 if ($FullStatsBatches.Count -gt 1) {
     $estimatedSeconds = ($FullStatsBatches.Count - 1) * $FullStatsPauseSeconds
@@ -683,11 +728,18 @@ foreach ($batch in $FullStatsBatches) {
 
                     $nmId = [Int64]$nmIdRaw
                     $key = "$advertId|$nmId"
+                    $campaignKey = [string]$advertId
+                    $isDirect = $false
+
+                    if ($CampaignNmSetMap.ContainsKey($campaignKey)) {
+                        $isDirect = $CampaignNmSetMap[$campaignKey].ContainsKey([string]$nmId)
+                    }
 
                     if (-not $StatsMap.ContainsKey($key)) {
                         $StatsMap[$key] = [pscustomobject]@{
                             AdvertId = $advertId
                             NmId = $nmId
+                            IsDirect = $isDirect
                             Name = ""
                             Views = [Int64]0
                             Clicks = [Int64]0
@@ -721,170 +773,238 @@ foreach ($batch in $FullStatsBatches) {
 
 
 # ================================================================
-# 12. ДОБАВЛЯЕМ НУЛЕВЫЕ ТОВАРЫ ПРОШЕДШИХ КАМПАНИЙ
+# 12. АГРЕГАЦИЯ FULLSTATS ДО УРОВНЯ КАМПАНИИ
 # ================================================================
-# Если товар есть в nm_settings, но в fullstats у него не было строки,
-# создаём строку с нулевыми метриками.
+#
+# Ключевая бизнес-логика:
+#   1 строка итогового CSV = 1 рекламная кампания.
+#
+# Артикул кампании определяется ТОЛЬКО по nm_settings самой кампании.
+# Все метрики fullstats (включая ассоциативные конверсии по другим nmId)
+# суммируются внутрь общей статистики этой рекламной кампании.
+#
+# Таким образом чужой nmId из ассоциативной конверсии больше не создаёт
+# отдельную строку "кампания + чужой артикул".
+
+$CampaignTotalsMap = @{}
 
 foreach ($advertId in $FullStatsIds) {
+    $campaignKey = [string]$advertId
+
+    $CampaignTotalsMap[$campaignKey] = [pscustomobject]@{
+        AdvertId = [Int64]$advertId
+        Views = [Int64]0
+        Clicks = [Int64]0
+        Atbs = [Int64]0
+        Orders = [Int64]0
+        Canceled = [Int64]0
+        Spend = [double]0
+        Revenue = [double]0
+
+        # Диагностика: какая часть заказов пришла по nmId,
+        # которого нет в nm_settings самой кампании.
+        AssocAtbs = [Int64]0
+        AssocOrders = [Int64]0
+        AssocCanceled = [Int64]0
+        AssocRevenue = [double]0
+    }
+}
+
+foreach ($stat in $StatsMap.Values) {
+    $campaignKey = [string]$stat.AdvertId
+
+    if (-not $CampaignTotalsMap.ContainsKey($campaignKey)) {
+        continue
+    }
+
+    $total = $CampaignTotalsMap[$campaignKey]
+
+    $total.Views += [Int64]$stat.Views
+    $total.Clicks += [Int64]$stat.Clicks
+    $total.Atbs += [Int64]$stat.Atbs
+    $total.Orders += [Int64]$stat.Orders
+    $total.Canceled += [Int64]$stat.Canceled
+    $total.Spend += [double]$stat.Spend
+    $total.Revenue += [double]$stat.Revenue
+
+    if (-not $stat.IsDirect) {
+        $total.AssocAtbs += [Int64]$stat.Atbs
+        $total.AssocOrders += [Int64]$stat.Orders
+        $total.AssocCanceled += [Int64]$stat.Canceled
+        $total.AssocRevenue += [double]$stat.Revenue
+    }
+}
+
+
+# ================================================================
+# 13. ФОРМИРУЕМ 1 СТРОКУ НА 1 РЕКЛАМНУЮ КАМПАНИЮ
+# ================================================================
+
+$Rows = @()
+$MultiCampaignRows = @()
+
+foreach ($advertId in ($FullStatsIds | Sort-Object)) {
     $campaignKey = [string]$advertId
 
     if (-not $CampaignInfoMap.ContainsKey($campaignKey)) {
         continue
     }
 
-    $campaign = $CampaignInfoMap[$campaignKey]
-
-    foreach ($nmSetting in @($campaign.NmSettings)) {
-        $nmIdRaw = Get-Field $nmSetting "nm_id" $null
-
-        if ($null -eq $nmIdRaw) {
-            $nmIdRaw = Get-Field $nmSetting "nmId" $null
-        }
-
-        if ($null -eq $nmIdRaw) {
-            continue
-        }
-
-        $nmId = [Int64]$nmIdRaw
-        $key = "$advertId|$nmId"
-
-        if (-not $StatsMap.ContainsKey($key)) {
-            $StatsMap[$key] = [pscustomobject]@{
-                AdvertId = [Int64]$advertId
-                NmId = $nmId
-                Name = ""
-                Views = [Int64]0
-                Clicks = [Int64]0
-                Atbs = [Int64]0
-                Orders = [Int64]0
-                Canceled = [Int64]0
-                Spend = [double]0
-                Revenue = [double]0
-            }
-        }
-    }
-}
-
-
-# ================================================================
-# 13. ИТОГОВЫЕ СТРОКИ
-# ================================================================
-
-$Rows = @()
-
-foreach ($stat in ($StatsMap.Values | Sort-Object AdvertId, NmId)) {
-    $campaignKey = [string]$stat.AdvertId
-
-    # В итог попадают только кампании, которые реально прошли spend filter.
     if (-not $SpendMap.ContainsKey($campaignKey)) {
         continue
     }
 
-    if ($SpendMap[$campaignKey].Spend -lt $MinCampaignSpend) {
-        continue
-    }
-
-    $campaign = $null
-
-    if ($CampaignInfoMap.ContainsKey($campaignKey)) {
-        $campaign = $CampaignInfoMap[$campaignKey]
-    }
-
+    $campaign = $CampaignInfoMap[$campaignKey]
     $updInfo = $SpendMap[$campaignKey]
+    $total = $CampaignTotalsMap[$campaignKey]
+
+    # Реальные рекламируемые артикулы берём только из nm_settings кампании.
+    $nmIds = @(
+        $CampaignNmSetMap[$campaignKey].Keys |
+            ForEach-Object { [Int64]$_ } |
+            Sort-Object -Unique
+    )
+
+    $nmCount = $nmIds.Count
+    $article = ""
+    $articleList = ""
+    $campaignCheck = "OK"
+
+    if ($nmCount -eq 1) {
+        $article = [string]$nmIds[0]
+        $articleList = [string]$nmIds[0]
+    }
+    elseif ($nmCount -gt 1) {
+        $articleList = ($nmIds -join ", ")
+        $campaignCheck = "ВНИМАНИЕ: несколько артикулов"
+
+        Write-Log "ВНИМАНИЕ: кампания $advertId содержит $nmCount артикулов: $articleList"
+
+        $MultiCampaignRows += [pscustomobject][ordered]@{
+            "ID кампании"       = [Int64]$advertId
+            "Название кампании" = $campaign.Name
+            "Тип РК"            = (Get-BidTypeName $campaign.BidType)
+            "Артикулов в РК"    = $nmCount
+            "Артикулы"          = $articleList
+            "Статус"            = (Get-StatusName $campaign.Status)
+            "Проверка"          = "Требует разбиения: в одной РК несколько артикулов"
+        }
+    }
+    else {
+        $campaignCheck = "ВНИМАНИЕ: артикул не найден в nm_settings"
+        Write-Log "ВНИМАНИЕ: у кампании $advertId не найден артикул в nm_settings."
+    }
+
+    # Наименование товара пытаемся взять из прямой строки fullstats.
+    # Дополнительных API-запросов ради названия не делаем.
+    $productName = ""
+
+    if ($nmCount -eq 1) {
+        $directKey = "$advertId|$($nmIds[0])"
+
+        if ($StatsMap.ContainsKey($directKey)) {
+            $productName = [string]$StatsMap[$directKey].Name
+        }
+    }
 
     $campaignName = $updInfo.CampaignName
-    $bidTypeName = "Не определено"
+    if (-not [string]::IsNullOrWhiteSpace($campaign.Name)) {
+        $campaignName = $campaign.Name
+    }
+
+    $bidTypeName = Get-BidTypeName $campaign.BidType
+
     $paymentType = $updInfo.PaymentType
+    if (-not [string]::IsNullOrWhiteSpace($campaign.PaymentType)) {
+        $paymentType = $campaign.PaymentType
+    }
+
     $statusName = Get-StatusName $updInfo.Status
-    $created = ""
-
-    if ($null -ne $campaign) {
-        if (-not [string]::IsNullOrWhiteSpace($campaign.Name)) {
-            $campaignName = $campaign.Name
-        }
-
-        $bidTypeName = Get-BidTypeName $campaign.BidType
-
-        if (-not [string]::IsNullOrWhiteSpace($campaign.PaymentType)) {
-            $paymentType = $campaign.PaymentType
-        }
-
-        if ($null -ne $campaign.Status) {
-            $statusName = Get-StatusName $campaign.Status
-        }
-
-        $created = $campaign.Created
+    if ($null -ne $campaign.Status) {
+        $statusName = Get-StatusName $campaign.Status
     }
 
-    $ctr = if ($stat.Views -gt 0) {
-        [Math]::Round(($stat.Clicks / $stat.Views) * 100, 2)
-    }
-    else {
-        0
-    }
+    # Все показатели ниже — ОБЩИЕ по кампании.
+    # Ассоциативные конверсии уже включены в Orders / Revenue / Atbs.
+    $acceptedOrders = [Int64]$total.Orders - [Int64]$total.Canceled
 
-    $cr = if ($stat.Clicks -gt 0) {
-        [Math]::Round(($stat.Orders / $stat.Clicks) * 100, 2)
+    $ctr = if ($total.Views -gt 0) {
+        [Math]::Round(($total.Clicks / $total.Views) * 100, 2)
     }
-    else {
-        0
-    }
+    else { 0 }
 
-    $cpc = if ($stat.Clicks -gt 0) {
-        [Math]::Round($stat.Spend / $stat.Clicks, 2)
+    $cr = if ($total.Clicks -gt 0) {
+        [Math]::Round(($total.Orders / $total.Clicks) * 100, 2)
     }
-    else {
-        0
-    }
+    else { 0 }
 
-    $cpm = if ($stat.Views -gt 0) {
-        [Math]::Round(($stat.Spend / $stat.Views) * 1000, 2)
+    $cpc = if ($total.Clicks -gt 0) {
+        [Math]::Round($total.Spend / $total.Clicks, 2)
     }
-    else {
-        0
-    }
+    else { 0 }
 
-    $drr = if ($stat.Revenue -gt 0) {
-        [Math]::Round(($stat.Spend / $stat.Revenue) * 100, 2)
+    $cpm = if ($total.Views -gt 0) {
+        [Math]::Round(($total.Spend / $total.Views) * 1000, 2)
     }
-    else {
-        0
+    else { 0 }
+
+    $cpo = if ($total.Orders -gt 0) {
+        [Math]::Round($total.Spend / $total.Orders, 2)
     }
+    else { 0 }
+
+    $drr = if ($total.Revenue -gt 0) {
+        [Math]::Round(($total.Spend / $total.Revenue) * 100, 2)
+    }
+    else { 0 }
 
     $Rows += [pscustomobject][ordered]@{
-        "Название кампании"      = $campaignName
-        "Раздел (тип РК)"        = $bidTypeName
-        "ID кампании"            = $stat.AdvertId
-        "Артикул"                = $stat.NmId
-        "Наименование"           = $stat.Name
-        "Дата создания"          = $created
-        "Статус"                 = $statusName
-        "Модель оплаты"          = $paymentType
-        "Период с"               = $BeginDate
-        "Период по"              = $EndDate
-        "Показы"                 = $stat.Views
-        "Клики"                  = $stat.Clicks
-        "Расход рекламы"         = [Math]::Round($stat.Spend, 2)
-        "ДРР Реклама (acc.)"     = $drr
-        "CTR"                    = $ctr
-        "Корзины (acc.)"         = $stat.Atbs
-        "Заказы (acc.)"          = $stat.Orders
-        "Отмены заказов"         = $stat.Canceled
-        "Выручка (acc.)"         = [Math]::Round($stat.Revenue, 2)
-        "CR (acc.)"              = $cr
-        "CPC"                    = $cpc
-        "CPM"                    = $cpm
-        "Расход кампании 7д upd" = [Math]::Round($updInfo.Spend, 2)
+        "Название кампании"          = $campaignName
+        "Раздел (тип РК)"            = $bidTypeName
+        "ID кампании"                = [Int64]$advertId
+        "Артикул"                    = $article
+        "Артикулы РК"                = $articleList
+        "Количество артикулов в РК"  = $nmCount
+        "Проверка РК"                = $campaignCheck
+        "Наименование"               = $productName
+        "Дата создания"              = $campaign.Created
+        "Статус"                     = $statusName
+        "Модель оплаты"              = $paymentType
+        "Период с"                   = $BeginDate
+        "Период по"                  = $EndDate
+
+        # Метрики кампании, включая ассоциативные конверсии.
+        "Показы"                     = $total.Views
+        "Клики"                      = $total.Clicks
+        "Расход рекламы"             = [Math]::Round($total.Spend, 2)
+        "ДРР Реклама (acc.)"         = $drr
+        "CTR"                        = $ctr
+        "Корзины (acc.)"             = $total.Atbs
+        "Заказы (acc.)"              = $total.Orders
+        "Принятые заказы"            = $acceptedOrders
+        "Отмены заказов"             = $total.Canceled
+        "Выручка (acc.)"             = [Math]::Round($total.Revenue, 2)
+        "CR (acc.)"                  = $cr
+        "CPC"                        = $cpc
+        "CPM"                        = $cpm
+        "CPO"                        = $cpo
+
+        # Контрольные поля рабочей версии.
+        # Они показывают, какая часть итогов пришла от ассоциативных nmId.
+        "Ассоц. заказы (контроль)"   = $total.AssocOrders
+        "Ассоц. отмены (контроль)"   = $total.AssocCanceled
+        "Ассоц. выручка (контроль)"  = [Math]::Round($total.AssocRevenue, 2)
+
+        "Расход кампании 7д upd"     = [Math]::Round($updInfo.Spend, 2)
     }
 }
 
-
-Write-Log "Итоговых строк кампания + артикул: $($Rows.Count)."
+Write-Log "Итоговых строк: $($Rows.Count) (1 строка = 1 кампания)."
+Write-Log "Кампаний с несколькими артикулами: $($MultiCampaignRows.Count)."
 
 
 # ================================================================
-# 14. CSV
+# 14. ОСНОВНОЙ CSV
 # ================================================================
 
 $Headers = @(
@@ -892,6 +1012,9 @@ $Headers = @(
     "Раздел (тип РК)",
     "ID кампании",
     "Артикул",
+    "Артикулы РК",
+    "Количество артикулов в РК",
+    "Проверка РК",
     "Наименование",
     "Дата создания",
     "Статус",
@@ -905,14 +1028,18 @@ $Headers = @(
     "CTR",
     "Корзины (acc.)",
     "Заказы (acc.)",
+    "Принятые заказы",
     "Отмены заказов",
     "Выручка (acc.)",
     "CR (acc.)",
     "CPC",
     "CPM",
+    "CPO",
+    "Ассоц. заказы (контроль)",
+    "Ассоц. отмены (контроль)",
+    "Ассоц. выручка (контроль)",
     "Расход кампании 7д upd"
 )
-
 
 if ($Rows.Count -gt 0) {
     $csvLines = $Rows |
@@ -932,7 +1059,6 @@ else {
     $csvLines = @($tempCsv[0])
 }
 
-
 $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
 [System.IO.File]::WriteAllLines(
@@ -943,7 +1069,52 @@ $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
 
 # ================================================================
-# 15. БЕЗОПАСНАЯ ЗАМЕНА CSV
+# 15. ОТДЕЛЬНЫЙ СПИСОК КАМПАНИЙ С НЕСКОЛЬКИМИ АРТИКУЛАМИ
+# ================================================================
+
+$MultiHeaders = @(
+    "ID кампании",
+    "Название кампании",
+    "Тип РК",
+    "Артикулов в РК",
+    "Артикулы",
+    "Статус",
+    "Проверка"
+)
+
+if ($MultiCampaignRows.Count -gt 0) {
+    $multiCsvLines = $MultiCampaignRows |
+        Select-Object $MultiHeaders |
+        ConvertTo-Csv -NoTypeInformation -Delimiter ";"
+}
+else {
+    $emptyMulti = [ordered]@{}
+
+    foreach ($header in $MultiHeaders) {
+        $emptyMulti[$header] = ""
+    }
+
+    $multiTempCsv = [pscustomobject]$emptyMulti |
+        ConvertTo-Csv -NoTypeInformation -Delimiter ";"
+
+    $multiCsvLines = @($multiTempCsv[0])
+}
+
+[System.IO.File]::WriteAllLines(
+    $MultiTempPath,
+    $multiCsvLines,
+    $utf8Bom
+)
+
+if (Test-Path -LiteralPath $MultiPath) {
+    Remove-Item -LiteralPath $MultiPath -Force -ErrorAction SilentlyContinue
+}
+
+Move-Item -LiteralPath $MultiTempPath -Destination $MultiPath -Force
+
+
+# ================================================================
+# 16. БЕЗОПАСНАЯ ЗАМЕНА ОСНОВНОГО CSV
 # ================================================================
 
 $replaceAttempts = 12
@@ -975,7 +1146,6 @@ for ($attempt = 1; $attempt -le $replaceAttempts; $attempt++) {
     }
 }
 
-
 if (-not $replaceSucceeded) {
     $fallback = Join-Path $ScriptDir ("WB_Реклама_7дней_NEW_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
@@ -989,16 +1159,20 @@ if (-not $replaceSucceeded) {
 
 Write-Log "ГОТОВО."
 Write-Log "CSV: $OutputPath"
+Write-Log "Мультиартикульные РК: $MultiPath"
 Write-Log "Период: $BeginDate - $EndDate."
 Write-Log "Кампаний с затратами: $($SpendMap.Count)."
-Write-Log "Кампаний с расходом >= $MinCampaignSpend руб.: $($QualifiedIds.Count)."
+Write-Log "Кампаний с фактическим расходом > 0 руб.: $($QualifiedIds.Count)."
 Write-Log "Кампаний отправлено в fullstats: $($FullStatsIds.Count)."
-Write-Log "Строк: $($Rows.Count)."
+Write-Log "Строк итогового отчёта: $($Rows.Count)."
+Write-Log "Кампаний с несколькими артикулами: $($MultiCampaignRows.Count)."
 
 Write-Host ""
 Write-Host "ОБНОВЛЕНИЕ РЕКЛАМЫ ЗАВЕРШЕНО" -ForegroundColor Green
 Write-Host "Период: $BeginDate - $EndDate"
-Write-Host "Расход-фильтр: >= $MinCampaignSpend руб."
-Write-Host "Кампаний с расходом >= порога: $($QualifiedIds.Count)"
+Write-Host "Одна строка итогового CSV = одна рекламная кампания."
+Write-Host "Ассоциативные конверсии включены в общие показатели кампании."
+Write-Host "Кампаний с несколькими артикулами: $($MultiCampaignRows.Count)"
 Write-Host "Запросов fullstats: $($FullStatsBatches.Count)"
 Write-Host "Файл: $OutputPath"
+Write-Host "Мультиартикульные РК: $MultiPath"
