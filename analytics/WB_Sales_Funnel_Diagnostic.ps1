@@ -33,6 +33,92 @@ function Get-Field {
     return $p.Value
 }
 
+function Invoke-WBPostUtf8 {
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [Parameter(Mandatory=$true)][string]$JsonBody,
+        [Parameter(Mandatory=$true)][string]$AuthorizationHeader,
+        [int]$TimeoutMilliseconds = 120000
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create($Uri)
+    $request.Method = "POST"
+    $request.Timeout = $TimeoutMilliseconds
+    $request.ReadWriteTimeout = $TimeoutMilliseconds
+    $request.Accept = "application/json"
+    $request.ContentType = "application/json; charset=utf-8"
+    $request.Headers["Authorization"] = $AuthorizationHeader
+
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($JsonBody)
+    $request.ContentLength = $bodyBytes.Length
+
+    $requestStream = $request.GetRequestStream()
+    try {
+        $requestStream.Write($bodyBytes, 0, $bodyBytes.Length)
+    }
+    finally {
+        $requestStream.Dispose()
+    }
+
+    $response = $null
+
+    try {
+        $response = [System.Net.HttpWebResponse]$request.GetResponse()
+        $stream = $response.GetResponseStream()
+        $memory = New-Object System.IO.MemoryStream
+
+        try {
+            $stream.CopyTo($memory)
+            $rawBytes = $memory.ToArray()
+        }
+        finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+            $memory.Dispose()
+        }
+
+        # Принудительно декодируем ответ WB как UTF-8.
+        # Windows PowerShell 5.1 иначе может испортить русские названия.
+        $jsonText = [System.Text.Encoding]::UTF8.GetString($rawBytes)
+
+        if ([string]::IsNullOrWhiteSpace($jsonText)) {
+            return $null
+        }
+
+        return ($jsonText | ConvertFrom-Json)
+    }
+    catch [System.Net.WebException] {
+        $errorBody = ""
+
+        if ($null -ne $_.Exception.Response) {
+            try {
+                $errorResponse = [System.Net.HttpWebResponse]$_.Exception.Response
+                $errorStream = $errorResponse.GetResponseStream()
+                $errorMemory = New-Object System.IO.MemoryStream
+
+                try {
+                    $errorStream.CopyTo($errorMemory)
+                    $errorBody = [System.Text.Encoding]::UTF8.GetString($errorMemory.ToArray())
+                }
+                finally {
+                    if ($null -ne $errorStream) { $errorStream.Dispose() }
+                    $errorMemory.Dispose()
+                }
+            }
+            catch {
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($errorBody)) {
+            throw "Ошибка WB API: $($_.Exception.Message)`nОтвет WB: $errorBody"
+        }
+
+        throw
+    }
+    finally {
+        if ($null -ne $response) { $response.Dispose() }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $TokenPath)) {
     throw "Не найден wb_analytics_token.txt рядом со скриптом."
 }
@@ -85,18 +171,12 @@ $bodyJson = $bodyObject | ConvertTo-Json -Depth 10
 
 $uri = "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products"
 
-$headers = @{
-    Authorization = "Bearer $Token"
-}
-
 try {
-    $response = Invoke-RestMethod `
-        -Method Post `
+    $response = Invoke-WBPostUtf8 `
         -Uri $uri `
-        -Headers $headers `
-        -ContentType "application/json; charset=utf-8" `
-        -Body ([System.Text.Encoding]::UTF8.GetBytes($bodyJson)) `
-        -TimeoutSec 120
+        -JsonBody $bodyJson `
+        -AuthorizationHeader ("Bearer " + $Token) `
+        -TimeoutMilliseconds 120000
 }
 catch {
     Write-Host ""
