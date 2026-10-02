@@ -45,9 +45,11 @@ $FullStatsPauseSeconds = 22
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $TokenPath  = Join-Path $ScriptDir "wb_adv_token.txt"
-$OutputPath = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.csv"
-$TempPath   = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.tmp.csv"
-$LogPath    = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.log"
+$OutputPath    = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.csv"
+$TempPath      = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.tmp.csv"
+$AssocPath     = Join-Path $ScriptDir "WB_Реклама_7дней_ASSOC_SOURCE_TEST.csv"
+$AssocTempPath = Join-Path $ScriptDir "WB_Реклама_7дней_ASSOC_SOURCE_TEST.tmp.csv"
+$LogPath       = Join-Path $ScriptDir "WB_Реклама_7дней_TEST.log"
 
 
 # ================================================================
@@ -602,6 +604,39 @@ foreach ($campaign in $items) {
 
 Write-Log "Из расход-фильтра найдены в справочнике 7/9/11: $($CampaignInfoMap.Count) из $($QualifiedIds.Count)."
 
+# Для каждой кампании отдельно запоминаем товары, которые действительно
+# находятся в её nm_settings. Это важно: fullstats может вернуть nmId товара,
+# который был КУПЛЕН после рекламы другой кампании. Такой nmId является
+# ассоциативной конверсией, а не рекламируемым товаром этой кампании.
+$CampaignNmSetMap = @{}
+$CampaignsWithoutNmSettings = 0
+
+foreach ($campaignKey in $CampaignInfoMap.Keys) {
+    $nmSet = @{}
+
+    foreach ($nmSetting in @($CampaignInfoMap[$campaignKey].NmSettings)) {
+        $nmIdRaw = Get-Field $nmSetting "nm_id" $null
+
+        if ($null -eq $nmIdRaw) {
+            $nmIdRaw = Get-Field $nmSetting "nmId" $null
+        }
+
+        if ($null -eq $nmIdRaw) {
+            continue
+        }
+
+        $nmSet[[string][Int64]$nmIdRaw] = $true
+    }
+
+    if ($nmSet.Count -eq 0) {
+        $CampaignsWithoutNmSettings++
+    }
+
+    $CampaignNmSetMap[$campaignKey] = $nmSet
+}
+
+Write-Log "Кампаний без nm_settings: $CampaignsWithoutNmSettings."
+
 # ================================================================
 # 10. ID ДЛЯ FULLSTATS
 # ================================================================
@@ -693,11 +728,18 @@ foreach ($batch in $FullStatsBatches) {
 
                     $nmId = [Int64]$nmIdRaw
                     $key = "$advertId|$nmId"
+                    $campaignKey = [string]$advertId
+                    $isDirect = $false
+
+                    if ($CampaignNmSetMap.ContainsKey($campaignKey)) {
+                        $isDirect = $CampaignNmSetMap[$campaignKey].ContainsKey([string]$nmId)
+                    }
 
                     if (-not $StatsMap.ContainsKey($key)) {
                         $StatsMap[$key] = [pscustomobject]@{
                             AdvertId = $advertId
                             NmId = $nmId
+                            IsDirect = $isDirect
                             Name = ""
                             Views = [Int64]0
                             Clicks = [Int64]0
@@ -763,6 +805,7 @@ foreach ($advertId in $FullStatsIds) {
             $StatsMap[$key] = [pscustomobject]@{
                 AdvertId = [Int64]$advertId
                 NmId = $nmId
+                IsDirect = $true
                 Name = ""
                 Views = [Int64]0
                 Clicks = [Int64]0
@@ -778,12 +821,84 @@ foreach ($advertId in $FullStatsIds) {
 
 
 # ================================================================
-# 13. ИТОГОВЫЕ СТРОКИ
+# 13. РАЗДЕЛЯЕМ ПРЯМЫЕ ТОВАРЫ И АССОЦИАТИВНЫЕ КОНВЕРСИИ
+# ================================================================
+#
+# Если nmId есть в nm_settings кампании — это реальный товар кампании.
+# Если nmId отсутствует в nm_settings — это товар, который купили после
+# взаимодействия с рекламой ДРУГОГО товара. В интерфейсе WB такие заказы
+# показываются отдельной строкой "Конверсии из других кампаний".
+#
+# В основном CSV ассоциативные строки НЕ будут привязаны к чужим campaign ID.
+# Мы агрегируем их по целевому артикулу и добавляем одну синтетическую строку.
+# Детальный источник сохраняем отдельно в ASSOC_SOURCE_TEST.csv.
+
+$AssocMap = @{}
+$AssocAuditRows = @()
+
+foreach ($stat in $StatsMap.Values) {
+    if ($stat.IsDirect) {
+        continue
+    }
+
+    $nmKey = [string]$stat.NmId
+
+    if (-not $AssocMap.ContainsKey($nmKey)) {
+        $AssocMap[$nmKey] = [pscustomobject]@{
+            NmId = [Int64]$stat.NmId
+            Name = ""
+            Atbs = [Int64]0
+            Orders = [Int64]0
+            Canceled = [Int64]0
+            Revenue = [double]0
+        }
+    }
+
+    $assoc = $AssocMap[$nmKey]
+
+    if (-not [string]::IsNullOrWhiteSpace($stat.Name)) {
+        $assoc.Name = $stat.Name
+    }
+
+    $assoc.Atbs += [Int64]$stat.Atbs
+    $assoc.Orders += [Int64]$stat.Orders
+    $assoc.Canceled += [Int64]$stat.Canceled
+    $assoc.Revenue += [double]$stat.Revenue
+
+    $sourceCampaignName = ""
+    if ($SpendMap.ContainsKey([string]$stat.AdvertId)) {
+        $sourceCampaignName = $SpendMap[[string]$stat.AdvertId].CampaignName
+    }
+
+    $AssocAuditRows += [pscustomobject][ordered]@{
+        "ID исходной кампании"       = $stat.AdvertId
+        "Название исходной кампании" = $sourceCampaignName
+        "Артикул конверсии"          = $stat.NmId
+        "Наименование"               = $stat.Name
+        "Корзины (acc.)"             = $stat.Atbs
+        "Заказы (acc.)"              = $stat.Orders
+        "Принятые заказы"            = ([Int64]$stat.Orders - [Int64]$stat.Canceled)
+        "Отмены заказов"             = $stat.Canceled
+        "Выручка (acc.)"             = [Math]::Round($stat.Revenue, 2)
+    }
+}
+
+Write-Log "Ассоциативных связок исходная кампания + купленный артикул: $($AssocAuditRows.Count)."
+Write-Log "Артикулов с ассоциативными конверсиями: $($AssocMap.Count)."
+
+# ================================================================
+# 14. ИТОГОВЫЕ СТРОКИ
 # ================================================================
 
 $Rows = @()
 
 foreach ($stat in ($StatsMap.Values | Sort-Object AdvertId, NmId)) {
+    # В основной CSV попадают только реальные товары кампании из nm_settings.
+    # Ассоциативные конверсии будут добавлены ниже отдельной строкой по товару.
+    if (-not $stat.IsDirect) {
+        continue
+    }
+
     $campaignKey = [string]$stat.AdvertId
 
     # В итог попадают только кампании, которые реально прошли spend filter.
@@ -894,11 +1009,45 @@ foreach ($stat in ($StatsMap.Values | Sort-Object AdvertId, NmId)) {
 }
 
 
-Write-Log "Итоговых строк кампания + артикул: $($Rows.Count)."
+# Добавляем одну строку "Конверсии из других кампаний" на каждый целевой товар.
+foreach ($assoc in ($AssocMap.Values | Sort-Object NmId)) {
+    if (($assoc.Orders -eq 0) -and ($assoc.Atbs -eq 0) -and ($assoc.Revenue -eq 0)) {
+        continue
+    }
+
+    $Rows += [pscustomobject][ordered]@{
+        "Название кампании"      = "Конверсии из других кампаний"
+        "Раздел (тип РК)"        = "Ассоциативная конверсия"
+        "ID кампании"            = ""
+        "Артикул"                = $assoc.NmId
+        "Наименование"           = $assoc.Name
+        "Дата создания"          = ""
+        "Статус"                 = ""
+        "Модель оплаты"          = ""
+        "Период с"               = $BeginDate
+        "Период по"              = $EndDate
+        "Показы"                 = 0
+        "Клики"                  = 0
+        "Расход рекламы"         = 0
+        "ДРР Реклама (acc.)"     = 0
+        "CTR"                    = 0
+        "Корзины (acc.)"         = $assoc.Atbs
+        "Заказы (acc.)"          = $assoc.Orders
+        "Принятые заказы"        = ([Int64]$assoc.Orders - [Int64]$assoc.Canceled)
+        "Отмены заказов"         = $assoc.Canceled
+        "Выручка (acc.)"         = [Math]::Round($assoc.Revenue, 2)
+        "CR (acc.)"              = 0
+        "CPC"                    = 0
+        "CPM"                    = 0
+        "Расход кампании 7д upd" = 0
+    }
+}
+
+Write-Log "Итоговых строк после разделения прямых и ассоциативных: $($Rows.Count)."
 
 
 # ================================================================
-# 14. CSV
+# 15. CSV
 # ================================================================
 
 $Headers = @(
@@ -956,9 +1105,27 @@ $utf8Bom = New-Object System.Text.UTF8Encoding($true)
     $utf8Bom
 )
 
+# Отдельный диагностический CSV: от каких кампаний пришли ассоциативные конверсии.
+if ($AssocAuditRows.Count -gt 0) {
+    $assocCsvLines = $AssocAuditRows |
+        ConvertTo-Csv -NoTypeInformation -Delimiter ";"
+
+    [System.IO.File]::WriteAllLines(
+        $AssocTempPath,
+        $assocCsvLines,
+        $utf8Bom
+    )
+
+    if (Test-Path -LiteralPath $AssocPath) {
+        Remove-Item -LiteralPath $AssocPath -Force -ErrorAction SilentlyContinue
+    }
+
+    Move-Item -LiteralPath $AssocTempPath -Destination $AssocPath -Force
+}
+
 
 # ================================================================
-# 15. БЕЗОПАСНАЯ ЗАМЕНА CSV
+# 16. БЕЗОПАСНАЯ ЗАМЕНА CSV
 # ================================================================
 
 $replaceAttempts = 12
@@ -1004,6 +1171,7 @@ if (-not $replaceSucceeded) {
 
 Write-Log "ГОТОВО."
 Write-Log "CSV: $OutputPath"
+Write-Log "Ассоциативные источники: $AssocPath"
 Write-Log "Период: $BeginDate - $EndDate."
 Write-Log "Кампаний с затратами: $($SpendMap.Count)."
 Write-Log "Кампаний с фактическим расходом > 0 руб.: $($QualifiedIds.Count)."
@@ -1017,3 +1185,4 @@ Write-Host "Расход-фильтр: все кампании с расходо
 Write-Host "Кампаний с фактическим расходом: $($QualifiedIds.Count)"
 Write-Host "Запросов fullstats: $($FullStatsBatches.Count)"
 Write-Host "Файл: $OutputPath"
+Write-Host "Ассоциативные источники: $AssocPath"
