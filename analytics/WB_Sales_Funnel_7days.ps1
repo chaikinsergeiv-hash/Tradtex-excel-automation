@@ -773,19 +773,14 @@ Write-Log "Без строки в истории остатков: $MissingStock
 $csvLines = $Rows |
     ConvertTo-Csv -NoTypeInformation -Delimiter ";"
 
-# Excel при двойном клике иногда перестаёт автоматически распознавать
-# разделитель CSV и открывает всю строку в одном столбце.
-# Строка sep=; — стандартная подсказка Excel о разделителе.
-$excelCsvLines = @("sep=;") + $csvLines
-
-# Для прямого открытия двойным кликом в русской версии Excel
-# надёжнее использовать системную Windows-1251. UTF-8 даже с BOM Excel 2016
-# иногда открывает как ANSI и превращает кириллицу в "РџС...".
+# CSV оставляем стандартным: без служебной строки sep=;.
+# Power Query должен читать его явно как ; + Windows-1251.
+# Это надёжнее для автоматического импорта и последующего обновления.
 $excelEncoding = [System.Text.Encoding]::GetEncoding(1251)
 
 [System.IO.File]::WriteAllLines(
     $TempPath,
-    $excelCsvLines,
+    $csvLines,
     $excelEncoding
 )
 
