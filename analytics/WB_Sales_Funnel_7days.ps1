@@ -110,6 +110,47 @@ function Get-Field {
     return $p.Value
 }
 
+function Convert-ToDoubleOrZero {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return [double]0
+    }
+
+    $text = ([string]$Value).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return [double]0
+    }
+
+    # В выгрузке WB пустой остаток может приходить как дефис/тире.
+    if ($text -eq "-" -or $text -eq "—" -or $text -eq "–") {
+        return [double]0
+    }
+
+    # Убираем обычные и неразрывные пробелы-разделители.
+    $text = $text.Replace([char]0x00A0, "").Replace(" ", "")
+
+    $number = [double]0
+    $styles = [System.Globalization.NumberStyles]::Any
+
+    $cultures = @(
+        [System.Globalization.CultureInfo]::CurrentCulture,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.CultureInfo]::GetCultureInfo("ru-RU")
+    )
+
+    foreach ($culture in $cultures) {
+        if ([double]::TryParse($text, $styles, $culture, [ref]$number)) {
+            return $number
+        }
+    }
+
+    # Остатки должны быть числом. Неизвестное текстовое значение
+    # безопасно трактуем как 0, чтобы одна ячейка не роняла весь отчёт.
+    return [double]0
+}
+
 function Invoke-WBPostUtf8 {
     param(
         [Parameter(Mandatory=$true)][string]$Uri,
@@ -386,116 +427,154 @@ if ($Products.Count -eq 0) {
 }
 
 # ================================================================
-# 7. СОЗДАЁМ ОДИН STOCK_HISTORY_DAILY_CSV НА 14 ДНЕЙ
+# 7. ИСТОРИЯ ОСТАТКОВ: ПОВТОРНО ИСПОЛЬЗУЕМ СВЕЖИЙ CSV, ЕСЛИ ОН УЖЕ ЕСТЬ
+# ================================================================
+#
+# Если предыдущий запуск уже успел скачать историю остатков, но упал
+# на локальной обработке, повторно НЕ создаём CSV-отчёт WB.
+# Кэш используется только если в нём есть обе граничные даты
+# текущего 14-дневного окна.
 # ================================================================
 
-Write-Log "Пауза $ApiPauseSeconds сек. перед созданием истории остатков."
-Start-Sleep -Seconds $ApiPauseSeconds
+$UseCachedStockCsv = $false
+$stockSourceCsv = $null
 
-$ReportId = [Guid]::NewGuid().ToString()
+if (Test-Path -LiteralPath $StockCsvCopyPath) {
+    try {
+        $cacheProbe = Import-Csv -LiteralPath $StockCsvCopyPath |
+            Select-Object -First 1
 
-$stockBodyObject = [ordered]@{
-    id = $ReportId
-    reportType = "STOCK_HISTORY_DAILY_CSV"
-    userReportName = "Tradtex funnel stock history 14d"
-    params = [ordered]@{
-        nmIds = @()
-        subjectIds = @()
-        brandNames = @()
-        tagIds = @()
-        currentPeriod = [ordered]@{
-            start = $StockBeginDate
-            end = $StockEndDate
+        if ($null -ne $cacheProbe) {
+            $firstDateColumn = $PastDateColumns[0]
+            $lastDateColumn = $CurrentDateColumns[$CurrentDateColumns.Count - 1]
+
+            $hasFirstDate = $null -ne $cacheProbe.PSObject.Properties[$firstDateColumn]
+            $hasLastDate = $null -ne $cacheProbe.PSObject.Properties[$lastDateColumn]
+
+            if ($hasFirstDate -and $hasLastDate) {
+                $UseCachedStockCsv = $true
+                $stockSourceCsv = $StockCsvCopyPath
+                Write-Log "Использую уже скачанную историю остатков за нужный 14-дневный период."
+            }
         }
-        stockType = ""
-        skipDeletedNm = $true
+    }
+    catch {
+        Write-Log "Локальный CSV остатков не подходит для повторного использования."
     }
 }
 
-$stockBodyJson = $stockBodyObject | ConvertTo-Json -Depth 10
-
-Write-Log "Создаю STOCK_HISTORY_DAILY_CSV. Report ID: $ReportId."
-
-$createResponse = Invoke-WBPostUtf8 `
-    -Uri "https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads" `
-    -JsonBody $stockBodyJson `
-    -AuthorizationHeader $Auth
-
 # ================================================================
-# 8. ЖДЁМ ГОТОВНОСТЬ ОТЧЁТА
+# 8. ЕСЛИ КЭША НЕТ — СОЗДАЁМ ОДИН STOCK_HISTORY_DAILY_CSV
 # ================================================================
 
-$statusUri = "https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads?filter%5BdownloadIds%5D=$ReportId"
-$reportStatus = ""
+if (-not $UseCachedStockCsv) {
+    Write-Log "Пауза $ApiPauseSeconds сек. перед созданием истории остатков."
+    Start-Sleep -Seconds $ApiPauseSeconds
 
-for ($check = 1; $check -le $ReportMaxChecks; $check++) {
-    Write-Log "Жду $ReportPollSeconds сек. перед проверкой статуса остатков ($check/$ReportMaxChecks)."
-    Start-Sleep -Seconds $ReportPollSeconds
+    $ReportId = [Guid]::NewGuid().ToString()
 
-    $statusResponse = Invoke-WBGetUtf8 `
-        -Uri $statusUri `
+    $stockBodyObject = [ordered]@{
+        id = $ReportId
+        reportType = "STOCK_HISTORY_DAILY_CSV"
+        userReportName = "Tradtex funnel stock history 14d"
+        params = [ordered]@{
+            nmIds = @()
+            subjectIds = @()
+            brandNames = @()
+            tagIds = @()
+            currentPeriod = [ordered]@{
+                start = $StockBeginDate
+                end = $StockEndDate
+            }
+            stockType = ""
+            skipDeletedNm = $true
+        }
+    }
+
+    $stockBodyJson = $stockBodyObject | ConvertTo-Json -Depth 10
+
+    Write-Log "Создаю STOCK_HISTORY_DAILY_CSV. Report ID: $ReportId."
+
+    $createResponse = Invoke-WBPostUtf8 `
+        -Uri "https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads" `
+        -JsonBody $stockBodyJson `
         -AuthorizationHeader $Auth
 
-    $statusItems = @($statusResponse.data)
+    $statusUri = "https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads?filter%5BdownloadIds%5D=$ReportId"
+    $reportStatus = ""
 
-    $report = $statusItems |
-        Where-Object { $_.id -eq $ReportId } |
-        Select-Object -First 1
+    for ($check = 1; $check -le $ReportMaxChecks; $check++) {
+        Write-Log "Жду $ReportPollSeconds сек. перед проверкой статуса остатков ($check/$ReportMaxChecks)."
+        Start-Sleep -Seconds $ReportPollSeconds
 
-    if ($null -eq $report) {
-        Write-Log "Отчёт истории остатков пока не найден в списке."
-        continue
+        $statusResponse = Invoke-WBGetUtf8 `
+            -Uri $statusUri `
+            -AuthorizationHeader $Auth
+
+        $statusItems = @($statusResponse.data)
+
+        $report = $statusItems |
+            Where-Object { $_.id -eq $ReportId } |
+            Select-Object -First 1
+
+        if ($null -eq $report) {
+            Write-Log "Отчёт истории остатков пока не найден в списке."
+            continue
+        }
+
+        $reportStatus = [string]$report.status
+        Write-Log "Статус истории остатков: $reportStatus."
+
+        if ($reportStatus -eq "SUCCESS") {
+            break
+        }
+
+        if ($reportStatus -eq "FAILED") {
+            throw "WB вернул FAILED для истории остатков. Report ID: $ReportId."
+        }
     }
 
-    $reportStatus = [string]$report.status
-    Write-Log "Статус истории остатков: $reportStatus."
-
-    if ($reportStatus -eq "SUCCESS") {
-        break
+    if ($reportStatus -ne "SUCCESS") {
+        throw "История остатков не успела подготовиться. Report ID: $ReportId."
     }
 
-    if ($reportStatus -eq "FAILED") {
-        throw "WB вернул FAILED для истории остатков. Report ID: $ReportId."
-    }
-}
+    Write-Log "Отчёт готов. Жду $ReportPollSeconds сек. перед скачиванием."
+    Start-Sleep -Seconds $ReportPollSeconds
 
-if ($reportStatus -ne "SUCCESS") {
-    throw "История остатков не успела подготовиться. Report ID: $ReportId."
+    $downloadUri = "https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads/file/$ReportId"
+
+    Download-WBFile `
+        -Uri $downloadUri `
+        -AuthorizationHeader $Auth `
+        -Path $StockZipPath
+
+    if (Test-Path -LiteralPath $StockExtractDir) {
+        Remove-Item -LiteralPath $StockExtractDir -Recurse -Force
+    }
+
+    New-Item -ItemType Directory -Path $StockExtractDir | Out-Null
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($StockZipPath, $StockExtractDir)
+
+    $stockCsvFiles = @(
+        Get-ChildItem -LiteralPath $StockExtractDir -Filter "*.csv" -File -Recurse
+    )
+
+    if ($stockCsvFiles.Count -eq 0) {
+        throw "В ZIP истории остатков не найден CSV."
+    }
+
+    $stockSourceCsv = $stockCsvFiles[0].FullName
+    Copy-Item -LiteralPath $stockSourceCsv -Destination $StockCsvCopyPath -Force
+
+    # Дальше читаем именно копию: она останется доступна при повторном запуске.
+    $stockSourceCsv = $StockCsvCopyPath
 }
 
 # ================================================================
-# 9. СКАЧИВАЕМ И ЧИТАЕМ CSV ОСТАТКОВ
+# 9. ЧИТАЕМ CSV ОСТАТКОВ
 # ================================================================
-
-Write-Log "Отчёт готов. Жду $ReportPollSeconds сек. перед скачиванием."
-Start-Sleep -Seconds $ReportPollSeconds
-
-$downloadUri = "https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads/file/$ReportId"
-
-Download-WBFile `
-    -Uri $downloadUri `
-    -AuthorizationHeader $Auth `
-    -Path $StockZipPath
-
-if (Test-Path -LiteralPath $StockExtractDir) {
-    Remove-Item -LiteralPath $StockExtractDir -Recurse -Force
-}
-
-New-Item -ItemType Directory -Path $StockExtractDir | Out-Null
-
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::ExtractToDirectory($StockZipPath, $StockExtractDir)
-
-$stockCsvFiles = @(
-    Get-ChildItem -LiteralPath $StockExtractDir -Filter "*.csv" -File -Recurse
-)
-
-if ($stockCsvFiles.Count -eq 0) {
-    throw "В ZIP истории остатков не найден CSV."
-}
-
-$stockSourceCsv = $stockCsvFiles[0].FullName
-Copy-Item -LiteralPath $stockSourceCsv -Destination $StockCsvCopyPath -Force
 
 $StockRows = @(Import-Csv -LiteralPath $stockSourceCsv)
 
@@ -539,11 +618,7 @@ foreach ($stockRow in $StockRows) {
 
     foreach ($dateColumn in ($PastDateColumns + $CurrentDateColumns)) {
         $valueRaw = Get-Field $stockRow $dateColumn 0
-        $value = [double]0
-
-        if ($null -ne $valueRaw -and -not [string]::IsNullOrWhiteSpace([string]$valueRaw)) {
-            $value = [double]$valueRaw
-        }
+        $value = Convert-ToDoubleOrZero $valueRaw
 
         if (-not $dayMap.ContainsKey($dateColumn)) {
             $dayMap[$dateColumn] = [double]0
