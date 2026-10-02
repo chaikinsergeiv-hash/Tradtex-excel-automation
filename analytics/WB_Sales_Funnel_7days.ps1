@@ -194,7 +194,7 @@ function Invoke-WBPostUtf8 {
         }
 
         if (-not [string]::IsNullOrWhiteSpace($errorBody)) {
-            throw "Ошибка WB API HTTP $status: $($_.Exception.Message).`nОтвет WB: $errorBody"
+            throw "Ошибка WB API HTTP ${status}: $($_.Exception.Message).`nОтвет WB: $errorBody"
         }
 
         throw
