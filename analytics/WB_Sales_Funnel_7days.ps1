@@ -773,11 +773,16 @@ Write-Log "Без строки в истории остатков: $MissingStock
 $csvLines = $Rows |
     ConvertTo-Csv -NoTypeInformation -Delimiter ";"
 
+# Excel при двойном клике иногда перестаёт автоматически распознавать
+# разделитель CSV и открывает всю строку в одном столбце.
+# Строка sep=; — стандартная подсказка Excel о разделителе.
+$excelCsvLines = @("sep=;") + $csvLines
+
 $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
 [System.IO.File]::WriteAllLines(
     $TempPath,
-    $csvLines,
+    $excelCsvLines,
     $utf8Bom
 )
 
