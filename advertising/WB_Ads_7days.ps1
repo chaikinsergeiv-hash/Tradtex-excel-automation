@@ -24,6 +24,12 @@ $ErrorActionPreference = "Stop"
 # Кампании с расходом меньше этого значения не запрашиваем в fullstats.
 $MinCampaignSpend = 100
 
+# Историю затрат /adv/v1/upd загружаем ПО ДНЯМ.
+# Это уменьшает размер каждого ответа и защищает от зависания длинного 7-дневного запроса.
+$UpdPauseMilliseconds = 1200
+$UpdTimeoutMilliseconds = 60000
+$UpdMaxAttempts = 3
+
 # fullstats: 3 запроса в минуту, официальный интервал 20 секунд.
 $FullStatsPauseSeconds = 22
 
@@ -177,7 +183,8 @@ function Invoke-WBGet {
     param(
         [Parameter(Mandatory=$true)][string]$BaseUri,
         [hashtable]$Query = @{},
-        [int]$MaxAttempts = 8
+        [int]$MaxAttempts = 8,
+        [int]$TimeoutMilliseconds = 180000
     )
 
     $parts = @()
@@ -200,8 +207,8 @@ function Invoke-WBGet {
         try {
             $request = [System.Net.HttpWebRequest]::Create($Uri)
             $request.Method = "GET"
-            $request.Timeout = 180000
-            $request.ReadWriteTimeout = 180000
+            $request.Timeout = $TimeoutMilliseconds
+            $request.ReadWriteTimeout = $TimeoutMilliseconds
             $request.Accept = "application/json"
             $request.Headers["Authorization"] = $script:AuthorizationHeader
             $request.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
@@ -269,6 +276,13 @@ function Invoke-WBGet {
                 }
             }
             catch {
+            }
+
+            if ($_.Exception.Status -eq [System.Net.WebExceptionStatus]::Timeout -and $attempt -lt $MaxAttempts) {
+                $wait = 10
+                Write-Log "WB API не ответил за $([Math]::Round($TimeoutMilliseconds / 1000)) сек. Попытка $attempt из $MaxAttempts. Повтор через $wait сек."
+                Start-Sleep -Seconds $wait
+                continue
             }
 
             if ($status -eq 429 -and $attempt -lt $MaxAttempts) {
@@ -349,26 +363,52 @@ Write-Log "Шаг 1: история затрат -> фильтр расход >=
 
 
 # ================================================================
-# 7. ОДИН ЗАПРОС: ИСТОРИЯ ФАКТИЧЕСКИХ ЗАТРАТ
+# 7. ИСТОРИЯ ФАКТИЧЕСКИХ ЗАТРАТ — ПО ОДНОМУ ДНЮ
 # ================================================================
 #
 # GET /adv/v1/upd?from=YYYY-MM-DD&to=YYYY-MM-DD
 #
-# В ответе может быть несколько строк одной кампании.
-# Поэтому updSum суммируем по advertId.
+# Раньше весь 7-дневный период запрашивался одним запросом.
+# На больших кабинетах этот запрос может долго отвечать и уйти в timeout.
+#
+# Теперь делаем 7 небольших запросов — по одному календарному дню.
+# Между запросами пауза 1,2 сек., чтобы соблюдать лимит API.
+# Если отдельный день не ответил за 60 сек., запрос автоматически повторяется.
 
 $UpdUrl = "https://advert-api.wildberries.ru/adv/v1/upd"
+$updRows = @()
 
-$updResponse = Invoke-WBGet `
-    -BaseUri $UpdUrl `
-    -Query @{
-        from = $BeginDate
-        to   = $EndDate
+for ($dayIndex = 0; $dayIndex -lt 7; $dayIndex++) {
+    $day = $DateFrom.AddDays($dayIndex)
+    $dayText = $day.ToString("yyyy-MM-dd")
+    $humanIndex = $dayIndex + 1
+
+    if ($dayIndex -gt 0) {
+        Start-Sleep -Milliseconds $UpdPauseMilliseconds
     }
 
-$updRows = @($updResponse)
+    Write-Log "История затрат: день $humanIndex из 7 ($dayText). Отправляю запрос..."
 
-Write-Log "Строк истории затрат получено: $($updRows.Count)."
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    $dayResponse = Invoke-WBGet `
+        -BaseUri $UpdUrl `
+        -Query @{
+            from = $dayText
+            to   = $dayText
+        } `
+        -MaxAttempts $UpdMaxAttempts `
+        -TimeoutMilliseconds $UpdTimeoutMilliseconds
+
+    $stopwatch.Stop()
+
+    $dayRows = @($dayResponse)
+    $updRows += $dayRows
+
+    Write-Log "История затрат: день $humanIndex из 7 получен за $([Math]::Round($stopwatch.Elapsed.TotalSeconds, 1)) сек. Строк: $($dayRows.Count)."
+}
+
+Write-Log "Строк истории затрат получено за 7 дней: $($updRows.Count)."
 
 
 # ================================================================
