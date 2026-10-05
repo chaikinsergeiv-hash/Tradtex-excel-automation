@@ -1,5 +1,5 @@
 ﻿# ================================================================
-# WB — ЦЕНЫ И СКИДКИ — TEST
+# WB — ЦЕНЫ И СКИДКИ
 #
 # Только чтение данных. Ничего в кабинете WB не изменяет.
 #
@@ -35,9 +35,9 @@ $MaxRetryCount = 4
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TokenPath = Join-Path $ScriptDir "wb_prices_token.txt"
 
-$OutputPath = Join-Path $ScriptDir "WB_Цены_Скидки_TEST.csv"
-$TempPath = Join-Path $ScriptDir "WB_Цены_Скидки_TEST.tmp.csv"
-$LogPath = Join-Path $ScriptDir "WB_Цены_Скидки_TEST.log"
+$OutputPath = Join-Path $ScriptDir "WB_Цены_Скидки.csv"
+$TempPath = Join-Path $ScriptDir "WB_Цены_Скидки.tmp.csv"
+$LogPath = Join-Path $ScriptDir "WB_Цены_Скидки.log"
 
 # ================================================================
 # 3. ФУНКЦИИ
@@ -418,7 +418,7 @@ for ($attempt = 1; $attempt -le $replaceAttempts; $attempt++) {
 
 if (-not $replaceSucceeded) {
     $fallback = Join-Path $ScriptDir (
-        "WB_Цены_Скидки_TEST_NEW_{0}.csv" -f
+        "WB_Цены_Скидки_NEW_{0}.csv" -f
         (Get-Date -Format "yyyyMMdd_HHmmss")
     )
 
