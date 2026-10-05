@@ -1,5 +1,5 @@
 ﻿# ================================================================
-# WB — ОСТАТКИ ПО СКЛАДАМ WILDBERRIES — TEST
+# WB — ОСТАТКИ ПО СКЛАДАМ WILDBERRIES
 #
 # Итог:
 #   1 строка = 1 артикул WB (nmId)
@@ -37,9 +37,9 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $TokenPath = Join-Path $ScriptDir "wb_analytics_token.txt"
 
-$OutputPath = Join-Path $ScriptDir "WB_Остатки_Склады_WB_TEST.csv"
-$TempPath = Join-Path $ScriptDir "WB_Остатки_Склады_WB_TEST.tmp.csv"
-$LogPath = Join-Path $ScriptDir "WB_Остатки_Склады_WB_TEST.log"
+$OutputPath = Join-Path $ScriptDir "WB_Остатки_Склады_WB.csv"
+$TempPath = Join-Path $ScriptDir "WB_Остатки_Склады_WB.tmp.csv"
+$LogPath = Join-Path $ScriptDir "WB_Остатки_Склады_WB.log"
 
 # ================================================================
 # 3. ФУНКЦИИ
@@ -401,7 +401,7 @@ for ($attempt = 1; $attempt -le $replaceAttempts; $attempt++) {
 
 if (-not $replaceSucceeded) {
     $fallback = Join-Path $ScriptDir (
-        "WB_Остатки_Склады_WB_TEST_NEW_{0}.csv" -f
+        "WB_Остатки_Склады_WB_NEW_{0}.csv" -f
         (Get-Date -Format "yyyyMMdd_HHmmss")
     )
 
