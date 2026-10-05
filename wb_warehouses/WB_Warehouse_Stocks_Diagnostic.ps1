@@ -20,16 +20,25 @@ $Body = @{
     offset = 0
 } | ConvertTo-Json -Depth 5
 
-$Headers = @{ Authorization = "Bearer $Token" }
-
 Write-Host "Диагностика остатков WB. Будет выполнен 1 запрос." -ForegroundColor Cyan
 
-$Response = Invoke-RestMethod -Method Post `
-    -Uri "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses" `
-    -Headers $Headers `
-    -ContentType "application/json; charset=utf-8" `
-    -Body ([System.Text.Encoding]::UTF8.GetBytes($Body)) `
-    -TimeoutSec 120
+$Client = New-Object System.Net.WebClient
+$Client.Encoding = [System.Text.Encoding]::UTF8
+$Client.Headers.Add("Authorization", ("Bearer " + $Token))
+$Client.Headers.Add("Content-Type", "application/json; charset=utf-8")
+
+try {
+    $ResponseText = $Client.UploadString(
+        "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses",
+        "POST",
+        $Body
+    )
+}
+finally {
+    $Client.Dispose()
+}
+
+$Response = $ResponseText | ConvertFrom-Json
 
 $Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $RawJson = $Response | ConvertTo-Json -Depth 30
