@@ -185,14 +185,15 @@ function Get-BidTypeName {
 # Одна функция для всех GET-запросов:
 #   - добавляет Bearer token;
 #   - сама декодирует UTF-8;
-#   - автоматически повторяет 429.
+#   - повторяет тайм-ауты, 429 и временные ошибки сервера.
 
 function Invoke-WBGet {
     param(
         [Parameter(Mandatory=$true)][string]$BaseUri,
         [hashtable]$Query = @{},
         [int]$MaxAttempts = 8,
-        [int]$TimeoutMilliseconds = 180000
+        [int]$TimeoutMilliseconds = 180000,
+        [int]$MinRetryDelaySeconds = 0
     )
 
     $parts = @()
@@ -208,6 +209,8 @@ function Invoke-WBGet {
     if ($parts.Count -gt 0) {
         $Uri = $BaseUri + "?" + ($parts -join "&")
     }
+
+    $serverErrorRetries = 0
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $response = $null
@@ -281,13 +284,16 @@ function Invoke-WBGet {
                     }
                     catch {
                     }
+                    finally {
+                        $webResponse.Dispose()
+                    }
                 }
             }
             catch {
             }
 
             if ($_.Exception.Status -eq [System.Net.WebExceptionStatus]::Timeout -and $attempt -lt $MaxAttempts) {
-                $wait = 10
+                $wait = [Math]::Max(10, $MinRetryDelaySeconds)
                 Write-Log "WB API не ответил за $([Math]::Round($TimeoutMilliseconds / 1000)) сек. Попытка $attempt из $MaxAttempts. Повтор через $wait сек."
                 Start-Sleep -Seconds $wait
                 continue
@@ -311,7 +317,16 @@ function Invoke-WBGet {
                     }
                 }
 
+                $wait = [Math]::Max($wait, $MinRetryDelaySeconds)
                 Write-Log "WB API вернул 429. Попытка $attempt из $MaxAttempts. Ждём $wait сек."
+                Start-Sleep -Seconds $wait
+                continue
+            }
+
+            if ($status -in 500, 502, 503, 504 -and $attempt -lt $MaxAttempts -and $serverErrorRetries -lt 3) {
+                $serverErrorRetries++
+                $wait = [Math]::Max($MinRetryDelaySeconds, [int](30 * [Math]::Pow(2, $serverErrorRetries - 1)))
+                Write-Log "WB API вернул HTTP ${status}. Попытка $attempt из $MaxAttempts. Повтор запроса через $wait сек."
                 Start-Sleep -Seconds $wait
                 continue
             }
@@ -700,6 +715,7 @@ foreach ($batch in $FullStatsBatches) {
 
     $statsResponse = Invoke-WBGet `
         -BaseUri "https://advert-api.wildberries.ru/adv/v3/fullstats" `
+        -MinRetryDelaySeconds $FullStatsPauseSeconds `
         -Query @{
             ids       = ($batch -join ",")
             beginDate = $BeginDate
