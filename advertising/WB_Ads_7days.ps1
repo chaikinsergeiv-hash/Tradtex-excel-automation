@@ -1,4 +1,4 @@
-﻿# ================================================================
+# ================================================================
 # WB РЕКЛАМА — СТАТИСТИКА ЗА 7 ДНЕЙ
 #
 # Архитектура:
@@ -38,6 +38,8 @@ $UpdMaxAttempts = 3
 
 # fullstats: 3 запроса в минуту, официальный интервал 20 секунд.
 $FullStatsPauseSeconds = 22
+$FullStatsMaxAttempts = 4
+$FullStatsMinBatchSize = 5
 
 
 # ================================================================
@@ -185,7 +187,7 @@ function Get-BidTypeName {
 # Одна функция для всех GET-запросов:
 #   - добавляет Bearer token;
 #   - сама декодирует UTF-8;
-#   - автоматически повторяет 429.
+#   - автоматически повторяет 429 и временные ошибки сервера WB.
 
 function Invoke-WBGet {
     param(
@@ -316,6 +318,16 @@ function Invoke-WBGet {
                 continue
             }
 
+            # WB иногда не успевает собрать fullstats и отвечает 500
+            # с DeadlineExceeded. Это временная серверная ошибка, как и
+            # 502/503/504, поэтому запрос безопасно повторяем.
+            if (($status -in @(500, 502, 503, 504)) -and $attempt -lt $MaxAttempts) {
+                $wait = [Math]::Max(22, 10 * $attempt)
+                Write-Log "WB API вернул HTTP $status (временная ошибка сервера). Попытка $attempt из $MaxAttempts. Повтор через $wait сек."
+                Start-Sleep -Seconds $wait
+                continue
+            }
+
             $hint = ""
 
             switch ($status) {
@@ -343,6 +355,56 @@ function Invoke-WBGet {
                 $response.Dispose()
             }
         }
+    }
+}
+
+
+# Получает fullstats для одного пакета. Если даже после повторов WB
+# возвращает DeadlineExceeded/5xx, пакет автоматически делится пополам.
+# Это сохраняет все кампании и уменьшает нагрузку на сервер WB.
+function Invoke-WBFullStatsBatch {
+    param(
+        [Parameter(Mandatory=$true)][object[]]$CampaignIds,
+        [Parameter(Mandatory=$true)][string]$BeginDate,
+        [Parameter(Mandatory=$true)][string]$EndDate
+    )
+
+    try {
+        return @(
+            Invoke-WBGet `
+                -BaseUri "https://advert-api.wildberries.ru/adv/v3/fullstats" `
+                -Query @{
+                    ids       = ($CampaignIds -join ",")
+                    beginDate = $BeginDate
+                    endDate   = $EndDate
+                } `
+                -MaxAttempts $FullStatsMaxAttempts
+        )
+    }
+    catch {
+        $errorText = [string]$_.Exception.Message
+        $isTemporaryServerError = ($errorText -match "HTTP (500|502|503|504)|DeadlineExceeded|context deadline exceeded")
+
+        if ((-not $isTemporaryServerError) -or $CampaignIds.Count -le $FullStatsMinBatchSize) {
+            throw
+        }
+
+        $leftSize = [Math]::Floor($CampaignIds.Count / 2)
+        $left = @($CampaignIds[0..($leftSize - 1)])
+        $right = @($CampaignIds[$leftSize..($CampaignIds.Count - 1)])
+
+        Write-Log "Fullstats: WB не обработал пакет из $($CampaignIds.Count) кампаний. Делим на $($left.Count) + $($right.Count)."
+        Write-Log "Пауза $FullStatsPauseSeconds сек. перед уменьшенным пакетом fullstats."
+        Start-Sleep -Seconds $FullStatsPauseSeconds
+
+        $combined = @()
+        $combined += @(Invoke-WBFullStatsBatch -CampaignIds $left -BeginDate $BeginDate -EndDate $EndDate)
+
+        Write-Log "Пауза $FullStatsPauseSeconds сек. между уменьшенными пакетами fullstats."
+        Start-Sleep -Seconds $FullStatsPauseSeconds
+
+        $combined += @(Invoke-WBFullStatsBatch -CampaignIds $right -BeginDate $BeginDate -EndDate $EndDate)
+        return $combined
     }
 }
 
@@ -698,13 +760,10 @@ foreach ($batch in $FullStatsBatches) {
 
     Write-Log "Fullstats: пакет $batchNumber из $($FullStatsBatches.Count)."
 
-    $statsResponse = Invoke-WBGet `
-        -BaseUri "https://advert-api.wildberries.ru/adv/v3/fullstats" `
-        -Query @{
-            ids       = ($batch -join ",")
-            beginDate = $BeginDate
-            endDate   = $EndDate
-        }
+    $statsResponse = Invoke-WBFullStatsBatch `
+        -CampaignIds $batch `
+        -BeginDate $BeginDate `
+        -EndDate $EndDate
 
     foreach ($campaignStat in @($statsResponse)) {
         $advertIdRaw = Get-Field $campaignStat "advertId" $null
@@ -1178,3 +1237,4 @@ Write-Host "Кампаний с несколькими артикулами: $($
 Write-Host "Запросов fullstats: $($FullStatsBatches.Count)"
 Write-Host "Файл: $OutputPath"
 Write-Host "Мультиартикульные РК: $MultiPath"
+
